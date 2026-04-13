@@ -8,7 +8,7 @@ const config = {
   proseWrap: "always",
   semi: true,
   trailingComma: "es5",
-  xmlWhitespaceSensitivity: "preserve",
+  xmlWhitespaceSensitivity: "ignore",
 };
 
 module.exports = config;

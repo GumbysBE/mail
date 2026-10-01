@@ -6,11 +6,15 @@ import os
 
 from odoo import fields, models, tools
 
-from odoo.addons.base.models.ir_mail_server import extract_rfc2822_addresses
-
 
 def format_emails(partners):
-    return [tools.formataddr((p.name or "", p.email)) for p in partners if p.email]
+    # Normalized like Odoo's own recipients: the envelope is filtered on them,
+    # case-sensitively (see ``send_validated_to`` in ``_prepare_email_message``)
+    return [
+        tools.formataddr((p.name or "", email))
+        for p in partners
+        for email in tools.mail.email_normalize_all(p.email)
+    ]
 
 
 def format_emails_raw(partners):
@@ -41,14 +45,14 @@ class MailMail(models.Model):
     def _prepare_outgoing_list(
         self, mail_server=False, recipients_follower_status=None
     ):
-        # First, return if we're not coming from the Mail Composer
         res = super()._prepare_outgoing_list(
             mail_server=mail_server,
             recipients_follower_status=recipients_follower_status,
         )
-        is_from_composer = self.env.context.get("is_from_composer", False)
-
-        if not is_from_composer:
+        # Only set for composer comments: Odoo also posts template notifications
+        # (e.g. the order confirmation) through the composer, without Cc / Bcc.
+        composer_recipient_ids = self.env.context.get("composer_recipient_ids")
+        if not composer_recipient_ids:
             return res
 
         # Every Cc partner is also a recipient and gets its own email,
@@ -59,34 +63,30 @@ class MailMail(models.Model):
         # holds the whole audience: partner_ids is empty for followers, and the
         # mail.mail of the other langs are unlinked as they are sent.
         partners_cc_bcc = self.recipient_cc_ids + self.recipient_bcc_ids
-        all_recipients = self.env["res.partner"].browse(
-            self.env.context.get("composer_recipient_ids") or []
-        )
+        all_recipients = self.env["res.partner"].browse(composer_recipient_ids)
         partner_to = all_recipients - partners_cc_bcc
         email_to = format_emails(partner_to)
         email_to_raw = format_emails_raw(partner_to)
         email_cc = format_emails_str(self.recipient_cc_ids)
-        email_bcc = [r.email for r in self.recipient_bcc_ids if r.email]
 
-        # Collect recipients (RCPT TO) and update all emails
-        # with the same To, Cc headers (to be shown by email client as users expect)
-        recipients = []
         for m in res:
-            m_email_to = m["email_to"][0]
-            rcpt_to = extract_rfc2822_addresses(m_email_to)[0]
-            recipients.append(rcpt_to)
+            # Odoo restricts the envelope of each email to its own
+            # email_to_normalized, so it still reaches only its recipient once
+            # the headers list everyone. Without a valid address that filter is
+            # off: keep Odoo's email, which then fails as invalid on its own.
+            if not m["partner_id"] or not m["email_to_normalized"]:
+                continue
 
-            # If the recipient is a Bcc, set a real Bcc header.
-            # _prepare_email_message uses it to build the envelope
-            # and then strips it, so it never leaks.
-            if rcpt_to in email_bcc:
+            # The Bcc header only adds the recipient to its own envelope:
+            # _prepare_email_message strips it, so it never leaks.
+            if m["partner_id"] in self.recipient_bcc_ids:
                 # Avoid mutating the shared headers by making a copy
-                m["headers"] = {**m["headers"], "Bcc": m_email_to}
+                m["headers"] = {**m["headers"], "Bcc": ", ".join(m["email_to"])}
                 # Optional legacy marker. Unlike Bcc it survives sending,
                 # so only add it when explicitly enabled (it would expose
                 # the bcc recipient otherwise).
                 if self._expose_bcc_marker():
-                    m["headers"]["X-Odoo-Bcc"] = m_email_to
+                    m["headers"]["X-Odoo-Bcc"] = ", ".join(m["email_to"])
 
             m.update(
                 {
@@ -95,8 +95,5 @@ class MailMail(models.Model):
                     "email_cc": email_cc,
                 }
             )
-
-        # Propagate recipients to override smtp_to `_prepare_email_message`
-        self.env.context = {**self.env.context, "recipients": list(recipients)}
 
         return res

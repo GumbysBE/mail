@@ -721,3 +721,49 @@ class TestMailCcBccDelivery(MailCommon):
         report = self._report(message)
         for email in self.emails:
             self.assertIn(self.cc_erik.email, email["msg_cc"] or "", report)
+
+    # ------------------------------------------------------------
+    # COMPOSER TO WITH A "DEFAULT RECIPIENTS" TEMPLATE
+    # ------------------------------------------------------------
+
+    def _default_recipients_composer(self, template, **values):
+        return (
+            self.env["mail.compose.message"]
+            .with_user(self.user_employee)
+            .with_context(
+                default_model=self.record._name,
+                default_res_ids=self.record.ids,
+                default_composition_mode="comment",
+                default_template_id=template.id,
+            )
+            .create(values)
+        )
+
+    def test_f11_default_recipients_template_keeps_suggested_to(self):
+        # A user writing with a "Default Recipients" template (e.g. the
+        # quotation "Send by email") gets Odoo's suggested recipients in To,
+        # among them the author of the last email on the document
+        writer = self.env["res.partner"].create(
+            {"name": "External Writer", "email": "writer@example.com"}
+        )
+        self.record.message_post(
+            body="<p>Question about the quotation</p>",
+            author_id=writer.id,
+            message_type="email",
+            subtype_xmlid="mail.mt_comment",
+        )
+        template = self._template(use_default_to=True, partner_to=False)
+        composer = self._default_recipients_composer(template)
+        self.assertEqual(composer.message_type, "comment")
+        self.assertIn(self.record, composer.partner_ids)
+        self.assertIn(writer, composer.partner_ids)
+
+    def test_f12_default_recipients_template_keeps_chosen_to(self):
+        # Odoo does not recompute To from a "Default Recipients" template once
+        # To holds partners: switching template keeps what the user chose
+        template_a = self._template(use_default_to=True, partner_to=False)
+        template_b = self._template(use_default_to=True, partner_to=False)
+        composer = self._default_recipients_composer(template_a)
+        composer.partner_ids = self.customer
+        composer.template_id = template_b
+        self.assertEqual(composer.partner_ids, self.customer)

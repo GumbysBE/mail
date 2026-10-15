@@ -3,11 +3,15 @@
 
 from odoo import fields, models, tools
 
-from odoo.addons.base.models.ir_mail_server import extract_rfc2822_addresses
-
 
 def format_emails(partners):
-    return [tools.formataddr((p.name or "", p.email)) for p in partners if p.email]
+    # Odoo only delivers a copy to addresses that match, case included, the
+    # normalized address it computed: a raw "Bart@Iko.com" would block it
+    return [
+        tools.formataddr((p.name or "", email))
+        for p in partners
+        for email in tools.mail.email_normalize_all(p.email)
+    ]
 
 
 def format_emails_raw(partners):
@@ -25,58 +29,65 @@ class MailMail(models.Model):
     email_bcc = fields.Char("Bcc", help="Blind Cc message recipients")
 
     def _prepare_outgoing_list(self, mail_server=False, doc_to_followers=None):
-        # First, return if we're not coming from the Mail Composer
+        """Give every copy the same To and Cc headers, as a mail client does.
+
+        Odoo sends one copy per recipient, each showing only that recipient.
+        For a message with Cc / Bcc, every copy shows the To and Cc partners of
+        the message instead, and the Bcc partners and followers stay hidden.
+        """
         res = super()._prepare_outgoing_list(
             mail_server=mail_server, doc_to_followers=doc_to_followers
         )
-        is_out_of_scope = len(self.ids) > 1
-        is_from_composer = self.env.context.get("is_from_composer", False)
-
-        if is_out_of_scope or not is_from_composer:
+        # Only set on emails of a message with Cc / Bcc: checking them first
+        # spares reading the message for every other email
+        if not self.email_cc and not self.email_bcc:
+            return res
+        # From the message, not the context: the email is then built the same
+        # way when sent right away, by the email queue or again with Retry
+        partners_to, partners_cc, partners_bcc = (
+            self.mail_message_id._get_cc_bcc_audience()
+        )
+        if not partners_cc and not partners_bcc:
             return res
 
-        # Prepare values for To, Cc headers
-        partners_cc_bcc = self.recipient_cc_ids + self.recipient_bcc_ids
-        partner_to_ids = [r.id for r in self.recipient_ids if r not in partners_cc_bcc]
-        partner_to = self.env["res.partner"].browse(partner_to_ids)
-        email_to = format_emails(partner_to)
-        email_to_raw = format_emails_raw(partner_to)
-        email_cc = format_emails_str(self.recipient_cc_ids)
-        email_bcc = [r.email for r in self.recipient_bcc_ids if r.email]
+        # Without To addresses, Odoo adds one copy for the Cc addresses only.
+        # Every Cc partner already has a copy of its own: it would get two.
+        res = [m for m in res if m["email_to"]]
 
-        # Collect recipients (RCPT TO) and update all emails
-        # with the same To, Cc headers (to be shown by email client as users expect)
-        recipients = set()
+        email_to = format_emails(partners_to)
+        email_to_raw = format_emails_raw(partners_to)
+        email_cc = format_emails(partners_cc)
+
         for m in res:
-            rcpt_to = None
-            if m["email_to"]:
-                rcpt_to = extract_rfc2822_addresses(m["email_to"][0])[0]
+            # Odoo delivers a copy only to its own recipient, even when the
+            # headers list everyone: that keeps every copy private. A copy
+            # without a valid address has nobody to go to: leave it to Odoo,
+            # which then marks only that recipient as failed.
+            if not m["partner_id"] or not m["email_to_normalized"]:
+                continue
 
-                # If the recipient is a Bcc, add an explicit header X-Odoo-Bcc.
-                # It won't be shown by the email client, but can be useful for a
-                # recipient to understand why they received a given email.
-                # Also note that in python3, the smtp.send_message method does not
-                # transmit the Bcc field of a Message object.
-                if rcpt_to in email_bcc:
-                    m["headers"].update({"X-Odoo-Bcc": m["email_to"][0]})
-
-            # in the absence of self.email_to, Odoo creates one special mail for CC
-            # see https://github.com/odoo/odoo/commit/46bad8f0
-            elif m["email_cc"]:
-                rcpt_to = extract_rfc2822_addresses(m["email_cc"][0])[0]
-
-            if rcpt_to:
-                recipients.add(rcpt_to)
+            # Odoo shares one headers dict between all copies: without a copy,
+            # one recipient's Bcc would land in everyone's email. Reply-All is
+            # dropped too: Odoo would merge it into To, Cc and Bcc included.
+            headers = {
+                key: value
+                for key, value in m["headers"].items()
+                if key != "X-Msg-To-Add"
+            }
+            # Bcc partners and followers must not appear in To or Cc, but Odoo
+            # only delivers to addresses found in the headers. A Bcc header
+            # with their own address lets the copy reach them, and Odoo removes
+            # Bcc before sending, so nobody sees it.
+            if m["partner_id"] not in partners_to + partners_cc:
+                headers["Bcc"] = ", ".join(m["email_to"])
 
             m.update(
                 {
                     "email_to": email_to,
                     "email_to_raw": email_to_raw,
                     "email_cc": email_cc,
+                    "headers": headers,
                 }
             )
-
-        if len(res) > len(recipients):
-            res.pop()
 
         return res

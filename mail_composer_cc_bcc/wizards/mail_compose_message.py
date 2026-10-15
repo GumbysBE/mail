@@ -102,11 +102,14 @@ class MailComposeMessage(models.TransientModel):
         cc_bcc_composers = self.filtered(lambda c: c._is_cc_bcc_template_composer())
         res = super(MailComposeMessage, self - cc_bcc_composers)._compute_partner_ids()
         for composer in cc_bcc_composers:
+            if composer.template_id.use_default_to and composer.partner_ids:
+                continue
             res_ids = composer._evaluate_res_ids() or [0]
             rendered_values = composer._generate_template_for_composer(
                 res_ids,
                 {"email_to", "partner_ids"},
-                allow_suggested=False,
+                allow_suggested=composer.message_type == "comment"
+                and not composer.subtype_is_log,
                 find_or_create_partners=True,
             )[res_ids[0]]
             if rendered_values.get("partner_ids"):

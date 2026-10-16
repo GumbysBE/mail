@@ -12,7 +12,8 @@ What each recipient gets
 - **Cc**: one email, visible in Cc.
 - **Bcc**: one email, visible nowhere, not even in the technical headers.
 - **Followers** of the document who are not in To or Cc: one email, hidden
-  like a Bcc.
+  like a Bcc. This holds for every email a user writes with a To, also
+  without Cc or Bcc.
 - Someone in To and in Cc or Bcc counts as To, and gets one email.
 - An internal user in Cc or Bcc gets an email, even when they handle
   notifications in Odoo.
@@ -34,7 +35,11 @@ Features
 - Automatic emails based on a template, such as the order confirmation, are
   sent with the template's Cc and Bcc, also when the template uses *Default
   Recipients*.
-- A reply keeps the Cc and Bcc of the message it answers.
+- A reply works as *Reply All* in a mail client. Answering a message sent
+  from Odoo keeps its To, Cc and Bcc. Answering an email received from outside
+  puts its sender and To in To, and its Cc in Cc; the aliases and the user
+  replying are left out, and unknown addresses become new contacts. Its Bcc is
+  never known, so a Bcc has to be added by hand.
 - The Cc and Bcc are stored on the message (*Cc (Partners)*, *Bcc (Partners)*)
   and shown on the email.
 - An email is sent the same way immediately, through the email queue, or again
@@ -43,7 +48,10 @@ Features
 What it leaves alone
 ====================
 
-- Messages without Cc or Bcc: Odoo's standard behavior.
+- Messages without To, Cc or Bcc (e.g. a message to the followers only):
+  Odoo's standard behavior, so the external followers show in To and can reply
+  to all.
+- Automatic emails without Cc or Bcc: Odoo's standard behavior.
 - A logged note: never emailed to Cc or Bcc, not even to the company defaults.
 - Mass mailing: no Cc or Bcc.
 - Emails sent with ``template.send_mail()`` (automations, scheduled actions):

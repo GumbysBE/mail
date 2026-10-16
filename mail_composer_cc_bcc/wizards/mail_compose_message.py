@@ -75,10 +75,10 @@ class MailComposeMessage(models.TransientModel):
             elif not is_user_email:
                 composer.partner_cc_ids = False
                 composer.partner_bcc_ids = False
-            elif composer.parent_id and composer.composition_mode == "comment":
-                # A reply goes to the same Cc / Bcc as the message it answers
-                composer.partner_cc_ids = composer.parent_id.recipient_cc_ids
-                composer.partner_bcc_ids = composer.parent_id.recipient_bcc_ids
+            elif composer._is_reply_composer():
+                _partners_to, composer.partner_cc_ids, composer.partner_bcc_ids = (
+                    composer.parent_id._get_reply_all_audience()
+                )
             elif not composer.template_id:
                 composer.partner_cc_ids = company.default_partner_cc_ids
                 composer.partner_bcc_ids = company.default_partner_bcc_ids
@@ -96,11 +96,16 @@ class MailComposeMessage(models.TransientModel):
     def _compute_partner_ids(self):
         """Keep the template Cc out of To: the module shows it in the Cc field.
 
-        Odoo turns the template Cc into regular recipients. Composers without a
-        template keep Odoo's own computation.
+        Odoo turns the template Cc into regular recipients, and replies to the
+        recipients of the message only, without its sender. Other composers
+        keep Odoo's own computation.
         """
         cc_bcc_composers = self.filtered(lambda c: c._is_cc_bcc_template_composer())
         res = super(MailComposeMessage, self - cc_bcc_composers)._compute_partner_ids()
+        for composer in (self - cc_bcc_composers).filtered(
+            lambda c: c._is_reply_composer()
+        ):
+            composer.partner_ids = composer.parent_id._get_reply_all_audience()[0]
         for composer in cc_bcc_composers:
             # As in Odoo: with "Default Recipients", a To already filled in is
             # kept, and a user writing the email gets the suggested recipients
@@ -129,6 +134,15 @@ class MailComposeMessage(models.TransientModel):
             self.template_id
             and self.composition_mode == "comment"
             and not self.composition_batch
+        )
+
+    def _is_reply_composer(self):
+        """Whether the composer answers a message, without a template."""
+        self.ensure_one()
+        return (
+            self.parent_id
+            and not self.template_id
+            and self.composition_mode == "comment"
         )
 
     def _get_partners_from_emails(self, emails):

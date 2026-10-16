@@ -4,11 +4,10 @@ import ast
 from unittest.mock import patch
 
 from odoo import Command
-from odoo.tests import tagged
+from odoo.tests import Form, tagged
+from odoo.tools import email_normalize_all, formataddr
 
 from odoo.addons.base.models.ir_mail_server import MailDeliveryException
-from odoo.tools import email_normalize_all
-
 from odoo.addons.mail.tests.common import MailCommon
 
 
@@ -84,7 +83,11 @@ class TestMailCcBccDelivery(MailCommon):
     # ------------------------------------------------------------
 
     def _composer(self, to, cc=None, bcc=None, lang=None, **values):
-        return (
+        """The composer filled in as a user does: through its form view.
+
+        ``values`` are fields the form does not show, given as defaults.
+        """
+        Composer = (
             self.env["mail.compose.message"]
             .with_user(self.user_employee)
             .with_context(
@@ -92,23 +95,69 @@ class TestMailCcBccDelivery(MailCommon):
                 default_model=self.record._name,
                 default_res_ids=self.record.ids,
                 default_composition_mode="comment",
-            )
-            .create(
-                {
-                    "subject": "Offerte",
-                    "body": "<p>Hello</p>",
-                    "partner_ids": [Command.set(to.ids)],
-                    "partner_cc_ids": [Command.set(cc.ids if cc else [])],
-                    "partner_bcc_ids": [Command.set(bcc.ids if bcc else [])],
-                    **values,
-                }
+                **{f"default_{field}": value for field, value in values.items()},
             )
         )
+        with Form(Composer) as composer:
+            composer.subject = "Offerte"
+            composer.body = "<p>Hello</p>"
+            for field, partners in (
+                (composer.partner_ids, to),
+                (composer.partner_cc_ids, cc),
+                (composer.partner_bcc_ids, bcc),
+            ):
+                field.clear()
+                for partner in partners or []:
+                    field.add(partner)
+        return composer.save()
 
     def _send(self, to, cc=None, bcc=None, lang=None):
         composer = self._composer(to, cc=cc, bcc=bcc, lang=lang)
         with self.mock_mail_gateway():
             composer._action_send_mail()
+        return self.record.message_ids[0]
+
+    def _reply_composer(self, parent, bcc=None):
+        """The composer of a reply, filled in as a user does."""
+        Composer = (
+            self.env["mail.compose.message"]
+            .with_user(self.user_employee)
+            .with_context(
+                default_model=self.record._name,
+                default_res_ids=self.record.ids,
+                default_composition_mode="comment",
+                default_parent_id=parent.id,
+            )
+        )
+        with Form(Composer) as composer:
+            composer.body = "<p>Reply</p>"
+            for partner in bcc or []:
+                composer.partner_bcc_ids.add(partner)
+        return composer.save()
+
+    def _addresses(self, recipients):
+        return ", ".join(
+            r if isinstance(r, str) else formataddr((r.name, r.email))
+            for r in recipients
+        )
+
+    def _receive_customer_reply(self, to, cc):
+        """The customer answers with Reply-All: to the catchall, and the
+        given partners or addresses."""
+        catchall = f"{self.alias_catchall}@{self.alias_domain}"
+        self.env["mail.thread"].message_process(
+            self.record._name,
+            f"""From: {formataddr((self.customer.name, self.customer.email))}
+To: {self._addresses([catchall, *to])}
+Cc: {self._addresses(cc)}
+Subject: Re: Offerte
+Message-ID: <reply-all@zenith.example.com>
+Content-Type: text/plain
+
+Agreed.
+""",
+            thread_id=self.record.id,
+        )
         return self.record.message_ids[0]
 
     def _envelopes(self):
@@ -388,9 +437,7 @@ class TestMailCcBccDelivery(MailCommon):
             self.customer, cc=self.cc_anna, bcc=self.bcc_bob + internal_bcc
         )
         report = self._report(message)
-        hidden = (self.cc_anna + self.bcc_bob + internal_bcc).mapped(
-            "email_normalized"
-        )
+        hidden = (self.cc_anna + self.bcc_bob + internal_bcc).mapped("email_normalized")
         for mail in self._new_mails:
             reply_all = ast.literal_eval(mail.headers or "{}").get("X-Msg-To-Add", "")
             for email in hidden:
@@ -402,19 +449,51 @@ class TestMailCcBccDelivery(MailCommon):
 
     def test_n4_reply_keeps_cc_bcc_of_parent_message(self):
         message = self._send(self.customer, cc=self.cc_anna, bcc=self.bcc_bob)
-        reply = (
-            self.env["mail.compose.message"]
-            .with_user(self.user_employee)
-            .with_context(
-                default_model=self.record._name,
-                default_res_ids=self.record.ids,
-                default_composition_mode="comment",
-                default_parent_id=message.id,
-            )
-            .create({"body": "<p>Reply</p>"})
-        )
+        reply = self._reply_composer(message)
+        self.assertEqual(reply.partner_ids, self.customer)
         self.assertEqual(reply.partner_cc_ids, self.cc_anna)
         self.assertEqual(reply.partner_bcc_ids, self.bcc_bob)
+
+    def test_n5_reply_to_customer_reply_all_keeps_its_cc(self):
+        # Ticket feedback: Odoo answered the Cc of the customer's email in To,
+        # and left out the customer
+        self._send(self.customer, cc=self.cc_anna)
+        incoming = self._receive_customer_reply(
+            to=[self.customer_upper],
+            cc=[
+                self.cc_anna,
+                self.user_employee.partner_id,
+                "Nieuw <nieuw@example.com>",
+            ],
+        )
+        # An email received never shows its Bcc: the user adds one
+        reply = self._reply_composer(incoming, bcc=self.bcc_bob)
+        new_contact = self.env["res.partner"].search(
+            [("email", "=", "nieuw@example.com")]
+        )
+        self.assertEqual(new_contact.name, "Nieuw")
+        self.assertFalse(new_contact.parent_id)
+        # The catchall and the user replying get nothing
+        self.assertEqual(reply.partner_ids, self.customer + self.customer_upper)
+        self.assertEqual(reply.partner_cc_ids, self.cc_anna + new_contact)
+        self.assertEqual(reply.partner_bcc_ids, self.bcc_bob)
+
+        with self.mock_mail_gateway():
+            reply._action_send_mail()
+        message = self.record.message_ids[0]
+        self._assert_each_received_once(
+            message,
+            self.customer
+            + self.customer_upper
+            + self.cc_anna
+            + new_contact
+            + self.bcc_bob,
+        )
+        report = self._report(message)
+        for email in self.emails:
+            self.assertIn(self.cc_anna.email, email["msg_cc"] or "", report)
+            if self.bcc_bob.email not in email["smtp_to_list"]:
+                self.assertNotIn(self.bcc_bob.email, email["message"].lower(), report)
 
     # ------------------------------------------------------------
     # FULL COVERAGE
@@ -501,7 +580,8 @@ class TestMailCcBccDelivery(MailCommon):
             composer._action_send_mail()
         sent = self._envelopes()
         self.assertEqual(
-            sorted(sent), [["oscar.olsen@orbit.example.com"], ["tom@zenith.example.com"]]
+            sorted(sent),
+            [["oscar.olsen@orbit.example.com"], ["tom@zenith.example.com"]],
         )
         self.assertFalse(self._new_mails.recipient_cc_ids, sent)
         self.assertFalse(any(e["msg_cc"] for e in self.emails), sent)
@@ -510,7 +590,10 @@ class TestMailCcBccDelivery(MailCommon):
         # Older versions added it to every copy, disclosing the Bcc
         self._send(self.customer, bcc=self.bcc_bob + self.bcc_bea)
         for email in self.emails:
-            self.assertNotIn("x-odoo-bcc", email["message"].lower(), email["smtp_to_list"])
+            self.assertNotIn(
+                "x-odoo-bcc", email["message"].lower(), email["smtp_to_list"]
+            )
+
     def test_g7_retry_after_smtp_failure(self):
         bcc = self.bcc_bob + self.bcc_bea
         composer = self._composer(self.customer, cc=self.cc_anna, bcc=bcc)
@@ -555,19 +638,33 @@ class TestMailCcBccDelivery(MailCommon):
         self.assertFalse(message.recipient_cc_ids)
         self.assertFalse(message.recipient_bcc_ids)
 
-    def test_g9_message_without_cc_bcc_like_odoo(self):
-        # Without Cc / Bcc the module stays out: Odoo's own Reply-All header
-        # and per-recipient To are kept
-        message = self._send(self.customer + self.customer_upper)
-        self._assert_each_received_once(message, self.customer + self.customer_upper)
-        mail = self._new_mails
-        self.assertIn("X-Msg-To-Add", mail.headers)
-        self.assertFalse(mail.email_cc)
+    def test_g9_followers_hidden_without_cc_bcc(self):
+        # Ticket feedback: with only a To, Odoo showed the external followers
+        # in everyone's To, so the customer saw who else reads along
+        self.user_admin.notification_type = "email"
+        self.record.message_subscribe((self.follower_external + self.partner_admin).ids)
+        to = self.customer + self.customer_upper
+        message = self._send(to)
+        self._assert_each_received_once(
+            message, to + self.follower_external + self.partner_admin
+        )
+        self.assertNotIn("X-Msg-To-Add", self._new_mails[0].headers)
         report = self._report(message)
         for email in self.emails:
             self.assertFalse(email["msg_cc"], report)
-            for address in email["smtp_to_list"]:
-                self.assertIn(address, (email["msg_to"] or "").lower(), report)
+            msg_to = (email["msg_to"] or "").lower()
+            for partner in to:
+                self.assertIn(partner.email_normalized, msg_to, report)
+            for follower in self.follower_external + self.partner_admin:
+                self.assertNotIn(follower.email_normalized, msg_to, report)
+
+    def test_g12_empty_to_keeps_odoo_headers(self):
+        # Without To, Cc or Bcc the followers are the audience: Odoo lists the
+        # external ones in To, so they can reply to all
+        self.record.message_subscribe(self.follower_external.ids)
+        message = self._send(self.env["res.partner"])
+        self._assert_each_received_once(message, self.follower_external)
+        self.assertIn("X-Msg-To-Add", self._new_mails.headers)
 
     def test_g10_partner_with_two_emails(self):
         message = self._send(self.customer + self.two_emails, cc=self.cc_anna)
@@ -578,7 +675,6 @@ class TestMailCcBccDelivery(MailCommon):
     def test_g11_only_cc_without_to(self):
         message = self._send(self.env["res.partner"], cc=self.cc_anna + self.cc_anne)
         self._assert_each_received_once(message, self.cc_anna + self.cc_anne)
-
 
     # ------------------------------------------------------------
     # FEATURES PROMISED BY THE README
@@ -643,8 +739,7 @@ class TestMailCcBccDelivery(MailCommon):
         self.assertFalse(notification.recipient_cc_ids)
         self.assertFalse(notification.recipient_bcc_ids)
         self.assertFalse(
-            notification.notification_ids.res_partner_id
-            & (self.cc_anna + self.bcc_bob)
+            notification.notification_ids.res_partner_id & (self.cc_anna + self.bcc_bob)
         )
         self.assertEqual(self._received(self.cc_anna), [0], self._envelopes())
         self.assertEqual(self._received(self.bcc_bob), [0], self._envelopes())

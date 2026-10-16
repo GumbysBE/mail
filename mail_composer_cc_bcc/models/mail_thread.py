@@ -31,25 +31,21 @@ class MailThread(models.AbstractModel):
     def _notify_by_email_get_base_mail_values(
         self, message, recipients_data, additional_values=None
     ):
-        """Mark the emails of a message with Cc / Bcc, and keep those
-        recipients out of Reply-All."""
+        """Mark the emails of a message with Cc / Bcc, and keep everyone but
+        the To and Cc out of Reply-All."""
         res = super()._notify_by_email_get_base_mail_values(
             message, recipients_data, additional_values=additional_values
         )
-        # No flagged recipient means no Cc / Bcc: spares reading the message
-        if not any(data.get("is_cc_bcc") for data in recipients_data):
+        if not message._has_cc_bcc_audience():
             return res
         _partners_to, partners_cc, partners_bcc = message._get_cc_bcc_audience()
-        if not partners_cc and not partners_bcc:
-            return res
-        # Shown on the email, and the sign for mail.mail that its copies need
-        # the Cc / Bcc headers, also when sent later by the queue or Retry
+        # Shown on the email in the backend
         if partners_cc:
             res["email_cc"] = format_emails_str(partners_cc)
         if partners_bcc:
             res["email_bcc"] = format_emails_str(partners_bcc)
         # Odoo lists every external recipient in this header and merges it into
-        # To at sending: the Cc and Bcc would end up in everyone's To
+        # To at sending: the Cc, Bcc and followers would end up in everyone's To
         if res.get("headers"):
             headers = ast.literal_eval(res["headers"])
             headers.pop("X-Msg-To-Add", None)
@@ -73,11 +69,10 @@ class MailThread(models.AbstractModel):
             return recipients_data
 
         # An explicit Cc / Bcc asks for an email, even to an internal user who
-        # chose to handle notifications in Odoo. The flag tells the next steps
-        # that this message has Cc / Bcc.
+        # chose to handle notifications in Odoo.
         for data in recipients_data:
             if data["id"] in partners_cc_bcc.ids:
-                data.update(notif="email", is_cc_bcc=True)
+                data["notif"] = "email"
         # Cc / Bcc partners who do not follow the document: built like Odoo
         # builds followers, so they are grouped by language and notification
         # group like any other recipient
@@ -93,7 +88,7 @@ class MailThread(models.AbstractModel):
                 missing.ids,
             )[0]
             recipients_data += [
-                {**data, "notif": "email", "is_cc_bcc": True}
+                {**data, "notif": "email"}
                 for data in missing_data.values()
                 if data["active"]
             ]

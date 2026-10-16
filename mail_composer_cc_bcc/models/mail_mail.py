@@ -32,23 +32,19 @@ class MailMail(models.Model):
         """Give every copy the same To and Cc headers, as a mail client does.
 
         Odoo sends one copy per recipient, each showing only that recipient.
-        For a message with Cc / Bcc, every copy shows the To and Cc partners of
-        the message instead, and the Bcc partners and followers stay hidden.
+        For a user's message with a To, Cc or Bcc, every copy shows the To and
+        Cc partners of the message instead, and the Bcc partners and followers
+        stay hidden.
         """
         res = super()._prepare_outgoing_list(
             mail_server=mail_server, doc_to_followers=doc_to_followers
         )
-        # Only set on emails of a message with Cc / Bcc: checking them first
-        # spares reading the message for every other email
-        if not self.email_cc and not self.email_bcc:
-            return res
         # From the message, not the context: the email is then built the same
         # way when sent right away, by the email queue or again with Retry
-        partners_to, partners_cc, partners_bcc = (
-            self.mail_message_id._get_cc_bcc_audience()
-        )
-        if not partners_cc and not partners_bcc:
+        message = self.mail_message_id
+        if not message._has_cc_bcc_audience():
             return res
+        partners_to, partners_cc, _partners_bcc = message._get_cc_bcc_audience()
 
         # Without To addresses, Odoo adds one copy for the Cc addresses only.
         # Every Cc partner already has a copy of its own: it would get two.

@@ -226,15 +226,19 @@ class TestMailCcBccRecipients(TransactionCase, MailCase):
 
         self._assert_mails(message, partners_to, partners_cc, partners_bcc)
 
-    def test_followers_are_to_recipients(self):
-        """Followers get the email, though they never reach partner_ids"""
-        partners_to = self.us1 + self.fr
-        message = self._send_from_followers("followers", partners_to, self.de, self.es)
+    def test_followers_are_hidden_recipients(self):
+        """Followers get the email, hidden like a Bcc: they are not in To"""
+        followers = self.us1 + self.fr
+        message = self._send_from_followers("followers", followers, self.de, self.es)
 
         self.assertFalse(
             message.partner_ids, "Followers are not added to partner_ids by Odoo"
         )
-        self._assert_mails(message, partners_to, self.de, self.es)
+        recipients = followers + self.de + self.es
+        self._assert_each_recipient_in_one_mail(message, recipients)
+        self._assert_one_email_per_recipient(recipients)
+        self._assert_same_to_cc_headers(self.env["res.partner"], self.de)
+        self._assert_bcc_header_on_bcc_emails_only(followers + self.es)
 
     def test_to_header_survives_sent_mails_being_unlinked(self):
         """Sent mails are unlinked: the last one must still show every To
@@ -253,20 +257,16 @@ class TestMailCcBccRecipients(TransactionCase, MailCase):
         # no _assert_mails here: the mail.mail are gone, only the emails remain
         self._assert_headers(partners_to, partners_cc, partners_bcc)
 
-    def test_no_recipient_left_refuses_to_send(self):
-        """Running out of recipients must raise, never fall back to To+Cc+Bcc
+    def test_invalid_recipient_never_falls_back_to_everyone(self):
+        """Without a valid address, Odoo's envelope filter is off.
 
-        The fallback would send to everyone at once and disclose the Bcc.
+        Its email must then fail on its own, never go to To+Cc+Bcc at once
+        and disclose the Bcc.
         """
-        mail_server = self.env["ir.mail_server"]
-        message = mail_server.build_email(
-            email_from="sender@example.com",
-            email_to=[self.us1.email],
-            subject="no-recipient-left",
-            body="<p>Hello</p>",
-            email_cc=self.de.email,
-            email_bcc=self.es.email,
+        invalid = self.env["res.partner"].create(
+            {"name": "Invalid", "email": "not-an-email"}
         )
-        server = mail_server.with_context(is_from_composer=True, recipients=[])
-        with self.assertRaises(ValueError):
-            server._prepare_email_message(message, None)
+        message = self._send("invalid-recipient", self.us1 + invalid, self.de, self.es)
+        self._assert_one_email_per_recipient(self.us1 + self.de + self.es)
+        notif = message.notification_ids.filtered(lambda n: n.res_partner_id == invalid)
+        self.assertEqual(notif.failure_type, "mail_email_invalid")
